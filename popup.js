@@ -32,7 +32,7 @@ document.addEventListener('DOMContentLoaded', () => {
         ZIP_IMAGES_PER_PART,
         ZIP_BYTES_PER_PART
     } = PIXIV_EXTRACTOR_CONFIG;
-    const ACTIVE_JOB_STATUSES = new Set(['running', 'cancelling']);
+    const ACTIVE_JOB_STATUSES = new Set(['starting', 'running', 'cancelling']);
 
     let allImages = [];
     let currentArtworkId = null;

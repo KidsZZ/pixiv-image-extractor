@@ -37,6 +37,8 @@
 - 多卷文件使用 `_part001.zip`、`_part002.zip` 格式命名
 - 下载与打包由后台隐藏文档执行，不依赖弹窗和当前标签页持续打开
 - 「停止后台任务」只停止后续处理，已经加入 Chrome 下载队列的任务会继续执行
+- 即使 Chrome 下载已暂停，也能停止后台处理并开始新任务；旧下载需要的 Blob 会保留到下载完成或中断，新任务复用隐藏文档
+- 暂停的旧下载会继续占用相应图片或 ZIP 的内存，可在下载管理器中恢复或取消来释放资源
 
 ## 文件名模板
 
@@ -68,6 +70,8 @@ pixiv-image-extractor/
 ├── rules.json         # declarativeNetRequest 规则（自动加 Referer 头）
 ├── lib/
 │   └── jszip.min.js   # JSZip 库（打包下载用）
+├── tests/
+│   └── download-lifecycle.test.cjs # 后台任务生命周期回归测试
 ├── icon*.png          # 扩展图标
 ├── .gitignore         # Git 忽略配置
 └── README.md          # 本文档
@@ -77,7 +81,9 @@ pixiv-image-extractor/
 
 - **提取策略**：调用 Pixiv 内部 API `/ajax/illust/{id}/pages` 获取所有图片 URL
 - **后台架构**：Service Worker 调度任务并通过 `chrome.storage.session` 保存进度
+- **任务状态**：启动、恢复、取消、进度写入及清理按同一队列串行处理；执行器就绪前使用 `starting` 状态
 - **持续执行**：Offscreen Document 负责获取图片、生成 ZIP 和管理 Blob 生命周期
+- **停止与清理**：停止后台处理与监控已提交下载分别执行；仅在无任务且无未完成下载时关闭隐藏文档
 - **Referer 处理**：通过 `declarativeNetRequest` 规则自动为 i.pximg.net 请求添加 Referer 头
 - **预览**：使用 regular 尺寸图片（master1200，约 1200px 宽）
 - **下载**：后台逐张获取 original 原图并转换为同源 Blob，再交给 `chrome.downloads`
@@ -94,3 +100,15 @@ pixiv-image-extractor/
 - 需要 Pixiv 登录状态才能调用 API
 - 下载保存到 Chrome 默认下载目录
 - Ugoira（动图）暂不支持，会作为普通图片处理
+
+## 本地回归测试
+
+测试使用 Node.js 内置测试运行器，无需安装 npm 依赖。两个 VM 加载真实后台和隐藏文档脚本，模拟 Chrome API 与图片响应；ZIP 测试使用项目自带的 JSZip 并检查解包内容。
+
+```powershell
+node --test tests/download-lifecycle.test.cjs
+```
+
+若环境禁止测试运行器创建子进程，可使用 Node.js 24 的 `node --test --test-isolation=none tests/download-lifecycle.test.cjs`。
+
+覆盖并发启动、启动期间恢复、worker 重启、暂停下载后停止、旧 Blob 与新任务共存、ZIP 分卷和下载中断等路径。这些回归测试不替代真实浏览器与 Pixiv 登录环境的验证。

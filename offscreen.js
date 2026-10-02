@@ -4,12 +4,22 @@ const DOWNLOAD_SCHEDULE_INTERVAL_MS = 100;
 const DOWNLOAD_POLL_INTERVAL_MS = 500;
 
 let activeJob = null;
+let completingJobId = null;
 let cancelRequested = false;
-let activeAbortController = null;
 let statusSequence = 0;
+let jobAbortController = null;
+const pendingDownloads = new Map();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender.id !== chrome.runtime.id || message?.target !== 'offscreen') return false;
+
+    if (message.action === 'get-executor-state') {
+        sendResponse({
+            activeJobId: activeJob?.jobId || completingJobId,
+            pendingDownloads: pendingDownloads.size
+        });
+        return false;
+    }
 
     if (message.action === 'start-job') {
         if (activeJob) {
@@ -20,16 +30,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         activeJob = message.job;
         cancelRequested = false;
         statusSequence = 0;
+        jobAbortController = new AbortController();
         sendResponse({ accepted: true });
 
         // 先响应 Service Worker，再开始耗时任务，避免启动消息通道被长期占用。
-        queueMicrotask(() => runJob(message.job));
+        queueMicrotask(() => runJob(message.job).catch(error => {
+            console.error('[后台执行器] 任务状态上报失败:', error);
+        }));
         return false;
     }
 
     if (message.action === 'cancel-job' && activeJob?.jobId === message.jobId) {
         cancelRequested = true;
-        activeAbortController?.abort();
+        jobAbortController?.abort();
         sendResponse({ accepted: true });
         return false;
     }
@@ -44,6 +57,7 @@ async function runJob(job) {
         parts: 0,
         failed: 0
     };
+    let finalUpdate;
 
     try {
         await (job.type === 'direct'
@@ -54,52 +68,54 @@ async function runJob(job) {
             const message = job.type === 'direct'
                 ? `已停止：处理 ${result.processed}/${result.total} 个下载任务`
                 : `已停止：处理 ${result.processed}/${result.total} 张，生成 ${result.parts} 个 ZIP`;
-            await reportStatus(job, {
+            finalUpdate = {
                 ...result,
                 status: 'cancelled',
                 message
-            });
+            };
         } else {
             const message = job.type === 'direct'
                 ? result.failed > 0
-                    ? `后台任务完成：${result.processed - result.failed} 张已加入队列，${result.failed} 张失败`
-                    : `已将 ${result.processed} 张图片加入 Chrome 下载队列`
+                    ? `后台任务完成：${result.processed - result.failed} 张下载完成，${result.failed} 张失败`
+                    : `已下载 ${result.processed} 张图片`
                 : `后台打包完成：${result.processed} 张图片，共 ${result.parts} 个 ZIP`;
 
-            await reportStatus(job, {
+            finalUpdate = {
                 ...result,
                 status: 'completed',
                 message
-            });
+            };
         }
     } catch (error) {
         if (cancelRequested || error?.name === 'AbortError') {
             const message = job.type === 'direct'
                 ? `已停止：处理 ${result.processed}/${result.total} 个下载任务`
                 : `已停止：处理 ${result.processed}/${result.total} 张，生成 ${result.parts} 个 ZIP`;
-            await reportStatus(job, {
+            finalUpdate = {
                 ...result,
                 status: 'cancelled',
                 message
-            });
+            };
         } else {
             console.error('[后台执行器] 任务失败:', error);
-            await reportStatus(job, {
+            finalUpdate = {
                 ...result,
                 status: 'error',
                 message: getErrorMessage(error, '后台任务执行失败')
-            });
+            };
         }
     } finally {
+        completingJobId = job.jobId;
         activeJob = null;
-        activeAbortController = null;
+        jobAbortController = null;
         cancelRequested = false;
 
-        // 状态已经持久化后关闭隐藏文档，释放 JSZip 与 Blob 相关资源。
+        // 先释放执行槽再发布终态；新任务可复用文档，旧下载仍由独立监控器持有。
         try {
-            await sendBackgroundRequest('close-offscreen-document', { jobId: job.jobId });
-        } catch {
-            // 文档关闭会使消息响应端消失，此处无需再次报告错误。
+            await reportStatus(job, finalUpdate);
+        } finally {
+            if (completingJobId === job.jobId) completingJobId = null;
+            await requestIdleClose();
         }
     }
 }
@@ -141,14 +157,23 @@ async function runDirectDownloadJob(job, result) {
 }
 
 async function downloadImageBlob(blob, filename) {
+    const download = await submitBlobDownload(blob, filename);
+    await waitForBrowserDownload(download);
+}
+
+async function submitBlobDownload(blob, filename) {
     const blobUrl = URL.createObjectURL(blob);
     try {
         const { downloadId } = await sendBackgroundRequest('create-browser-download', {
             options: { url: blobUrl, filename }
         });
-        await waitForBrowserDownload(downloadId);
-    } finally {
+        const entry = { downloadId, blobUrl };
+        pendingDownloads.set(downloadId, entry);
+        entry.completion = monitorBrowserDownload(downloadId, entry);
+        return entry;
+    } catch (error) {
         URL.revokeObjectURL(blobUrl);
+        throw error;
     }
 }
 
@@ -257,55 +282,75 @@ async function downloadZipBundle(job, bundle, partNumber, usePartNumber, result)
     if (cancelRequested) return false;
 
     const suffix = usePartNumber ? `_part${String(partNumber).padStart(3, '0')}` : '';
-    const blobUrl = URL.createObjectURL(zipBlob);
-    try {
-        const { downloadId } = await sendBackgroundRequest('create-browser-download', {
-            options: {
-                url: blobUrl,
-                filename: `${job.archiveName}${suffix}.zip`
-            }
-        });
+    const download = await submitBlobDownload(zipBlob, `${job.archiveName}${suffix}.zip`);
 
-        await reportStatus(job, {
-            ...result,
-            status: 'running',
-            message: `正在后台写入${partLabel}...`
-        });
-        await waitForBrowserDownload(downloadId);
-    } finally {
-        URL.revokeObjectURL(blobUrl);
-    }
+    await reportStatus(job, {
+        ...result,
+        status: 'running',
+        message: `正在后台写入${partLabel}...`
+    });
+    await waitForBrowserDownload(download);
     return true;
 }
 
 async function fetchImageBlob(url) {
-    const controller = new AbortController();
-    activeAbortController = controller;
+    // 使用整个任务的信号，取消发生在进度上报期间时也不会漏掉随后启动的 fetch。
+    const response = await fetch(url, { signal: jobAbortController.signal });
+    if (!response.ok) throw new Error(`图片请求失败：HTTP ${response.status}`);
 
+    const contentType = response.headers.get('content-type') || '';
+    if (contentType && !contentType.toLowerCase().startsWith('image/')) {
+        throw new Error(`图片响应类型异常：${contentType}`);
+    }
+    return await response.blob();
+}
+
+async function waitForBrowserDownload(entry) {
+    const signal = jobAbortController.signal;
+    if (signal.aborted) return false;
+
+    let onAbort;
+    const cancelled = new Promise(resolve => {
+        onAbort = () => resolve({ cancelled: true });
+        signal.addEventListener('abort', onAbort, { once: true });
+    });
     try {
-        const response = await fetch(url, { signal: controller.signal });
-        if (!response.ok) throw new Error(`图片请求失败：HTTP ${response.status}`);
-
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType && !contentType.toLowerCase().startsWith('image/')) {
-            throw new Error(`图片响应类型异常：${contentType}`);
-        }
-        return await response.blob();
+        const outcome = await Promise.race([entry.completion, cancelled]);
+        if (outcome.cancelled) return false;
+        if (outcome.error) throw new Error(`下载中断：${outcome.error}`);
+        return true;
     } finally {
-        if (activeAbortController === controller) activeAbortController = null;
+        signal.removeEventListener('abort', onAbort);
     }
 }
 
-async function waitForBrowserDownload(downloadId) {
+// 监控器不受任务取消影响。只有下载真正结束才释放 Blob，暂停期间继续保留。
+async function monitorBrowserDownload(downloadId, entry) {
     while (true) {
-        const { download } = await sendBackgroundRequest('get-browser-download', { downloadId });
-        if (!download) throw new Error('找不到刚创建的 ZIP 下载任务');
-        if (download.state === 'complete') return;
-        if (download.state === 'interrupted') {
-            throw new Error(`下载中断：${download.error || '未知原因'}`);
+        try {
+            const { download } = await sendBackgroundRequest('get-browser-download', { downloadId });
+            if (download?.state === 'complete' || download?.state === 'interrupted') {
+                URL.revokeObjectURL(entry.blobUrl);
+                pendingDownloads.delete(downloadId);
+                // 不等待清理消息，避免与正在等待 completion 的任务形成环形等待。
+                requestIdleClose();
+                return { error: download.state === 'interrupted' ? download.error || '未知原因' : null };
+            }
+        } catch (error) {
+            // 临时消息/查询失败不能证明下载结束，保留 Blob 并重试。
+            console.error('[后台下载] 查询下载状态失败:', error);
         }
 
         await delay(DOWNLOAD_POLL_INTERVAL_MS);
+    }
+}
+
+async function requestIdleClose() {
+    if (activeJob || completingJobId || pendingDownloads.size > 0) return;
+    try {
+        await sendBackgroundRequest('close-offscreen-document');
+    } catch {
+        // 文档关闭可能使消息通道断开。
     }
 }
 

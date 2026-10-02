@@ -9,10 +9,39 @@ const {
 } = PIXIV_EXTRACTOR_CONFIG;
 const OFFSCREEN_DOCUMENT_PATH = 'offscreen.html';
 const JOB_STATE_KEY = 'pixiv_download_job_state';
-const ACTIVE_JOB_STATUSES = new Set(['running', 'cancelling']);
+const ACTIVE_JOB_STATUSES = new Set(['starting', 'running', 'cancelling']);
 const TERMINAL_JOB_STATUSES = new Set(['completed', 'cancelled', 'error']);
 
 let creatingOffscreenDocument = null;
+let jobOperations = Promise.resolve();
+
+// 串行化状态读写及执行器的创建/清理，防止多个弹窗和进度消息互相覆盖。
+// 执行器必须先响应消息，再异步上报状态，避免等待本队列造成死锁。
+function withJobLock(operation) {
+    const result = jobOperations.then(operation);
+    jobOperations = result.catch(() => {});
+    return result;
+}
+
+function startDownloadJob(job) {
+    return withJobLock(() => startDownloadJobUnlocked(job));
+}
+
+function cancelDownloadJob(jobId) {
+    return withJobLock(() => cancelDownloadJobUnlocked(jobId));
+}
+
+function updateJobState(update) {
+    return withJobLock(() => updateJobStateUnlocked(update));
+}
+
+function getRecoverableJobState() {
+    return withJobLock(getRecoverableJobStateUnlocked);
+}
+
+function closeOffscreenDocumentForJob(jobId) {
+    return withJobLock(() => closeOffscreenDocumentForJobUnlocked(jobId));
+}
 
 chrome.runtime.onStartup.addListener(() => {
     reconcilePersistedState().catch(error => {
@@ -73,8 +102,8 @@ async function handleMessage(message, sender) {
     }
 }
 
-async function startDownloadJob(rawJob) {
-    const currentState = await getJobState();
+async function startDownloadJobUnlocked(rawJob) {
+    const currentState = await getRecoverableJobStateUnlocked();
     if (currentState && ACTIVE_JOB_STATUSES.has(currentState.status)) {
         throw new Error('已有下载任务正在后台运行，请等待完成或先停止当前任务');
     }
@@ -84,7 +113,7 @@ async function startDownloadJob(rawJob) {
     const initialState = {
         jobId: job.jobId,
         type: job.type,
-        status: 'running',
+        status: 'starting',
         message: job.type === 'direct' ? '正在启动后台下载...' : '正在启动后台打包...',
         processed: 0,
         total: job.images.length,
@@ -98,8 +127,7 @@ async function startDownloadJob(rawJob) {
     await saveAndBroadcastJobState(initialState);
 
     try {
-        // 清理上一个终态任务可能尚未来得及关闭的隐藏文档，避免新旧任务竞争。
-        await closeOffscreenDocument();
+        // 复用仍为已提交下载保留 Blob 的文档，不能在新任务启动时将其关闭。
         await setupOffscreenDocument();
         const response = await chrome.runtime.sendMessage({
             target: 'offscreen',
@@ -110,7 +138,9 @@ async function startDownloadJob(rawJob) {
         if (!response?.accepted) {
             throw new Error(response?.error || '后台执行器未接受任务');
         }
-        return { jobId: job.jobId, state: initialState };
+        const runningState = { ...initialState, status: 'running', updatedAt: Date.now() };
+        await saveAndBroadcastJobState(runningState);
+        return { jobId: job.jobId, state: runningState };
     } catch (error) {
         await saveAndBroadcastJobState({
             ...initialState,
@@ -118,12 +148,12 @@ async function startDownloadJob(rawJob) {
             message: getErrorMessage(error, '后台任务启动失败'),
             updatedAt: Date.now()
         });
-        await closeOffscreenDocumentForJob(job.jobId).catch(() => {});
+        await closeOffscreenDocumentForJobUnlocked(job.jobId).catch(() => {});
         throw error;
     }
 }
 
-async function cancelDownloadJob(jobId) {
+async function cancelDownloadJobUnlocked(jobId) {
     const state = await getJobState();
     if (!state || !ACTIVE_JOB_STATUSES.has(state.status)) {
         return { state };
@@ -159,7 +189,7 @@ async function cancelDownloadJob(jobId) {
     return { state: cancellingState };
 }
 
-async function updateJobState(rawUpdate) {
+async function updateJobStateUnlocked(rawUpdate) {
     const currentState = await getJobState();
     if (!currentState || rawUpdate?.jobId !== currentState.jobId) {
         return { ignored: true };
@@ -203,10 +233,13 @@ async function updateJobState(rawUpdate) {
     return { state: nextState, terminal: TERMINAL_JOB_STATUSES.has(nextState.status) };
 }
 
-async function getRecoverableJobState() {
+async function getRecoverableJobStateUnlocked() {
     const state = await getJobState();
     if (!state || !ACTIVE_JOB_STATUSES.has(state.status)) return state;
-    if (await hasOffscreenDocument()) return state;
+    if (await hasOffscreenDocument()) {
+        const executor = await getOffscreenExecutorState();
+        if (executor.activeJobId === state.jobId) return state;
+    }
 
     const interruptedState = {
         ...state,
@@ -289,9 +322,27 @@ async function closeOffscreenDocument() {
     }
 }
 
-async function closeOffscreenDocumentForJob(jobId) {
+async function getOffscreenExecutorState() {
+    const response = await chrome.runtime.sendMessage({
+        target: 'offscreen',
+        action: 'get-executor-state'
+    });
+    if (!response || !Number.isInteger(response.pendingDownloads)) {
+        throw new Error('无法读取后台执行器状态');
+    }
+    return response;
+}
+
+async function closeOffscreenDocumentForJobUnlocked(jobId) {
     const state = await getJobState();
-    if (state && ACTIVE_JOB_STATUSES.has(state.status) && state.jobId !== jobId) {
+    if (jobId && state?.jobId !== jobId) return { ignored: true };
+    if (state && ACTIVE_JOB_STATUSES.has(state.status)) {
+        return { ignored: true };
+    }
+    if (!await hasOffscreenDocument()) return {};
+    // 同一文档可能仍持有旧任务的下载；还要确认没有任务及未完成的下载。
+    const executor = await getOffscreenExecutorState();
+    if (executor.activeJobId || executor.pendingDownloads > 0) {
         return { ignored: true };
     }
     await closeOffscreenDocument();
